@@ -1,116 +1,163 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <EEPROM.h>
+#include <math.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-#define BUZZER_PIN 8
+const int MPU_ADDR = 0x68;
+const int BUZZ_PIN = 8;
 
-Adafruit_MPU6050 mpu;
+float calibAltOffset = 0.0f;
+float calibAzOffset  = 0.0f;
+float targetAlt = NAN;
+float targetAz  = NAN;
 
-float moonOffsetAlt = 0, moonOffsetAz = 0;
-float currentAlt = 0, currentAz = 0;
-float targetAlt = 0, targetAz = 0;
+float Q_angle = 0.001, Q_bias = 0.003, R_measure = 0.03;
+float angleAlt = 0, biasAlt = 0, PAlt[2][2] = {{0,0},{0,0}};
+float angleAz  = 0, biasAz  = 0, PAz[2][2]  = {{0,0},{0,0}};
 
-float alpha = 0.98;   // complementary filter weight
-float dt = 0.05;      // loop time (20 Hz)
+float kalmanUpdate(float newAngle,float newRate,float dt,
+                   float &angle,float &bias,float P[2][2]) {
+  float rate=newRate-bias;
+  angle+=dt*rate;
+  P[0][0]+=dt*(dt*P[1][1]-P[0][1]-P[1][0]+Q_angle);
+  P[0][1]-=dt*P[1][1];
+  P[1][0]-=dt*P[1][1];
+  P[1][1]+=Q_bias*dt;
+  float S=P[0][0]+R_measure;
+  float K0=P[0][0]/S, K1=P[1][0]/S;
+  float y=newAngle-angle;
+  angle+=K0*y; bias+=K1*y;
+  float P00=P[0][0], P01=P[0][1];
+  P[0][0]-=K0*P00; P[0][1]-=K0*P01;
+  P[1][0]-=K1*P00; P[1][1]-=K1*P01;
+  return angle;
+}
 
 void setup() {
+  pinMode(BUZZ_PIN, OUTPUT);
   Serial.begin(9600);
+  Wire.begin();
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED not found");
-    while (true);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); Wire.write(0);
+  Wire.endTransmission(true);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C)) {
+    Serial.println("OLED fail"); while(1);
   }
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
 
-  pinMode(BUZZER_PIN, OUTPUT);
-
- /*if (!mpu.begin()) {
-    Serial.println("MPU6050 not found");
-    while (true);
-  }*/
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-  // Load Moon offset from EEPROM
-  EEPROM.get(0, moonOffsetAlt);
-  EEPROM.get(sizeof(float), moonOffsetAz);
-
-  Serial.println("System ready");
+  // Splash screen
+  display.setCursor(0,0);
+  display.println("Guidance Ready");
+  display.display();
+  delay(2000);
+  display.clearDisplay();
 }
 
 void loop() {
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
+  static unsigned long lastTime=millis();
+  unsigned long now=millis();
+  float dt=(now-lastTime)/1000.0; if(dt<=0) dt=0.001; lastTime=now;
 
-  // Estimate orientation from accelerometer
-  float accelAlt = atan2(accel.acceleration.y, accel.acceleration.z) * 180 / PI;
-  float accelAz  = atan2(accel.acceleration.x, accel.acceleration.z) * 180 / PI;
+  // Read raw MPU6050 data
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR,14,true);
+  if(Wire.available()<14) { delay(10); return; }
 
-  // Complementary filter (gyro integration + accel correction)
-  currentAlt = alpha * (currentAlt + gyro.gyro.x * dt) + (1 - alpha) * accelAlt;
-  currentAz  = alpha * (currentAz + gyro.gyro.y * dt) + (1 - alpha) * accelAz;
+  int16_t axRaw=Wire.read()<<8|Wire.read();
+  int16_t ayRaw=Wire.read()<<8|Wire.read();
+  int16_t azRaw=Wire.read()<<8|Wire.read();
+  Wire.read(); Wire.read(); // skip temp
+  int16_t gxRaw=Wire.read()<<8|Wire.read();
+  int16_t gyRaw=Wire.read()<<8|Wire.read();
+  Wire.read(); Wire.read(); // skip gz
 
-  // Apply Moon offset
-  currentAlt += moonOffsetAlt;
-  currentAz  += moonOffsetAz;
+  float axScaled=axRaw/16384.0;
+  float ayScaled=ayRaw/16384.0;
+  float azScaled=azRaw/16384.0;
+  float gxScaled=gxRaw/131.0;
+  float gyScaled=gyRaw/131.0;
 
-  // Handle serial input
+  float denom=sqrt(ayScaled*ayScaled+azScaled*azScaled); if(denom==0) denom=0.0001;
+  float accelAlt=atan2(axScaled,denom)*180/M_PI;
+  float accelAz=atan2(ayScaled,axScaled)*180/M_PI;
+
+  float altitude=kalmanUpdate(accelAlt,gxScaled,dt,angleAlt,biasAlt,PAlt);
+  float azimuth=kalmanUpdate(accelAz,gyScaled,dt,angleAz,biasAz,PAz);
+
+  if(isnan(altitude)) altitude=accelAlt;
+  if(isnan(azimuth)) azimuth=accelAz;
+
+  float currentAlt=altitude+calibAltOffset;
+  float currentAz=azimuth+calibAzOffset;
+
+  // --- Handle serial commands ---
   if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    if (input.startsWith("CALIBRATE_MOON")) {
-      int firstComma = input.indexOf(',');
-      int secondComma = input.indexOf(',', firstComma + 1);
-      float moonAlt = input.substring(firstComma + 1, secondComma).toFloat();
-      float moonAz  = input.substring(secondComma + 1).toFloat();
-
-      moonOffsetAlt = moonAlt - currentAlt;
-      moonOffsetAz  = moonAz - currentAz;
-
-      EEPROM.put(0, moonOffsetAlt);
-      EEPROM.put(sizeof(float), moonOffsetAz);
-
-      Serial.println("Moon calibration stored");
-    } else {
-      int comma = input.indexOf(',');
-      targetAlt = input.substring(0, comma).toFloat();
-      targetAz  = input.substring(comma + 1).toFloat();
+    char first = Serial.peek();
+    if (first == 'C') {
+      // Calibration string
+      String msg = Serial.readStringUntil('\n');
+      msg.trim();
+      if (msg.startsWith("CALIBRATE_MOON")) {
+        int c1=msg.indexOf(','), c2=msg.indexOf(',',c1+1);
+        if(c1>0 && c2>c1) {
+          float moonAlt=msg.substring(c1+1,c2).toFloat();
+          float moonAz=msg.substring(c2+1).toFloat();
+          calibAltOffset=moonAlt-altitude;
+          calibAzOffset=moonAz-azimuth;
+          Serial.print("Offsets set: ");
+          Serial.print(calibAltOffset);
+          Serial.print(", ");
+          Serial.println(calibAzOffset);
+        }
+      }
+    } else if (Serial.available() >= 8) {
+      // Binary float target
+      byte buf[8];
+      Serial.readBytes(buf, 8);
+      float tAlt, tAz;
+      memcpy(&tAlt, &buf[0], 4);
+      memcpy(&tAz, &buf[4], 4);
+      targetAlt = tAlt;
+      targetAz  = tAz;
+      Serial.print("Target set (binary): ");
+      Serial.print(targetAlt);
+      Serial.print(", ");
+      Serial.println(targetAz);
     }
   }
 
-  // Guidance logic
-  float dAlt = targetAlt - currentAlt;
-  float dAz  = targetAz - currentAz;
+  // OLED output
+  static unsigned long lastOLED=0;
+  if(millis()-lastOLED>200) {
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.print("Alt: "); display.println(currentAlt,1);
+    display.print("Az:  "); display.println(currentAz,1);
 
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("Alt Err: "); display.println(dAlt, 1);
-  display.print("Az Err: ");  display.println(dAz, 1);
+    if(!isnan(targetAlt) && !isnan(targetAz)) {
+      display.print("Target Alt: "); display.println(targetAlt,1);
+      display.print("Target Az:  "); display.println(targetAz,1);
+      if(fabs(currentAlt-targetAlt)<2 && fabs(currentAz-targetAz)<2) {
+        display.println("Aligned!"); tone(BUZZ_PIN,1000,200);
+      } else {
+        if(currentAlt<targetAlt) display.println("Move Up");
+        else display.println("Move Down");
+        if(currentAz<targetAz) display.println("Move Right");
+        else display.println("Move Left");
+      }
+    } else {
+      display.println("No target set");
+    }
 
-  if (abs(dAlt) < 1 && abs(dAz) < 1) {
-    display.println("Aligned!");
-    tone(BUZZER_PIN, 1000); // steady tone
-  } else {
-    if (dAlt > 1) display.println("Move Up");
-    else if (dAlt < -1) display.println("Move Down");
-
-    if (dAz > 1) display.println("Move Right");
-    else if (dAz < -1) display.println("Move Left");
-
-    noTone(BUZZER_PIN);
-    tone(BUZZER_PIN, 500, 200); // short beep
+    display.display();
+    lastOLED=millis();
   }
-
-  display.display();
-  delay(50);
 }
