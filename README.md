@@ -14,16 +14,6 @@ ADS-TGT-001 is a Windows application that streams telescope guidance coordinates
   - Bundles `de421.bsp` locally (no runtime downloads)
   - Installs VC++ runtime automatically
 - **No Admin Rights Needed**: Runs entirely in user space.
-
----
-
-## 📂 Project Structure
-ADS-TGT-001/
-├─ dist/ADS-TGT-001.exe        # PyInstaller-built executable
-├─ extras/de421.bsp            # Ephemeris file (bundled locally)
-├─ extras/vc_redist.x64.exe    # VC++ runtime installer
-└─ installer.iss               # Inno Setup script
-
 ---
 ## 📥 Download
 Grab the latest installer from [Releases](../../releases).
